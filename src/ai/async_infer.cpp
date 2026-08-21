@@ -1,5 +1,7 @@
 #include "ai/async_infer.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <utility>
 
 namespace axpipeline::ai {
@@ -76,6 +78,7 @@ void AsyncInfer::SetCallbacks(ResultCallback on_result, ErrorCallback on_error) 
 
 void AsyncInfer::ThreadMain() {
     for (;;) {
+        const auto t_wait0 = std::chrono::steady_clock::now();
         ResultCallback on_result;
         ErrorCallback on_error;
 
@@ -86,6 +89,8 @@ void AsyncInfer::ThreadMain() {
             on_result = on_result_;
             on_error = on_error_;
         }
+        const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_wait0).count();
 
         limiter_.Throttle();
 
@@ -101,6 +106,7 @@ void AsyncInfer::ThreadMain() {
         }
         if (!frame) continue;
 
+        const auto t_infer0 = std::chrono::steady_clock::now();
         std::vector<Detection> dets;
         std::string err;
         bool ok = false;
@@ -113,6 +119,14 @@ void AsyncInfer::ThreadMain() {
             ok = false;
             err = "plugin client threw";
         }
+        const auto infer_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_infer0).count();
+
+        if ((seq % 5) == 0) {
+            std::fprintf(stderr, "[async_infer] seq=%llu wait_us=%lld infer_us=%lld\n",
+                         (unsigned long long)seq, (long long)wait_us, (long long)infer_us);
+        }
+
         if (!ok) {
             if (on_error) on_error(err, seq);
             continue;

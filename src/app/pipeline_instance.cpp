@@ -98,6 +98,20 @@ void PipelineInstance::BuildFrameCallback() {
 
         const auto n = counter->fetch_add(1, std::memory_order_relaxed) + 1;
 
+        // 计时：frame callback（VDEC 解码输出）节奏
+        {
+            static std::chrono::steady_clock::time_point last{};
+            const auto now = std::chrono::steady_clock::now();
+            if ((n % 30) == 0) {
+                if (last.time_since_epoch().count() != 0) {
+                    const auto d = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+                    std::fprintf(stderr, "[pipeline_frame] frame=%llu delta_us=%lld\n",
+                                 (unsigned long long)n, (long long)d);
+                }
+                last = now;
+            }
+        }
+
         const auto every = p.log_every_n_frames == 0 ? 30U : p.log_every_n_frames;
         if ((n % every) == 0) {
             std::cout << "[pipeline=" << p.name << " dev=" << p.device_id << "] "
