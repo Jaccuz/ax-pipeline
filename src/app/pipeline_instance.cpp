@@ -216,11 +216,11 @@ void PipelineInstance::StartNpuIfEnabled() {
                     ai::MapDetectionsInferToSource(map, sw, sh, &dets);
                 }
 
-                // 精度对比：dump 检测框（源图坐标）到文件，AXP_DUMP_DETS=1 启用
+                // 精度对比：dump 检测框（源图坐标）到文件，AXP_DUMP_DETS=1 启用；带 pipeline name 前缀区分多路
                 if (EnvFlagEnabled("AXP_DUMP_DETS")) {
                     std::FILE* df = std::fopen("/tmp/ax_dets_dump.txt", "a");
                     if (df) {
-                        std::fprintf(df, "%llu", static_cast<unsigned long long>(seq));
+                        std::fprintf(df, "%s %llu", name.c_str(), static_cast<unsigned long long>(seq));
                         for (const auto& d : dets) {
                             std::fprintf(df, " %.1f,%.1f,%.1f,%.1f,%.3f", d.x0, d.y0, d.x1, d.y1, d.score);
                         }
