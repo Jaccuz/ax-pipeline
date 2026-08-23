@@ -43,7 +43,7 @@
         {
           "codec": "h264",
           "uris": [
-            "rtsp://192.168.71.121:8554/cam1_preview"
+            "rtsp://192.168.71.125:8554/cam1_preview"
           ]
         }
       ]
@@ -84,7 +84,7 @@
         {
           "codec": "h264",
           "uris": [
-            "rtsp://192.168.71.121:8554/cam2_preview"
+            "rtsp://192.168.71.125:8554/cam2_preview"
           ]
         }
       ]
