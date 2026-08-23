@@ -158,7 +158,8 @@ public:
             if (!GetOptString(s, "vnpu_mode", &cfg.vnpu_mode)) return false;
         }
 
-        if (!j.contains("pipelines") || !j["pipelines"].is_array() || j["pipelines"].empty()) {
+        // 允许空 pipelines 数组（app.py 统一拉起 ax_pipeline_app 后，动态 AddPipeline 按需加流）
+        if (!j.contains("pipelines") || !j["pipelines"].is_array()) {
             if (error) *error = "missing pipelines[]";
             return false;
         }
