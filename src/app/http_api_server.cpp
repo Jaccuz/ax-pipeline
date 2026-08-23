@@ -62,8 +62,13 @@ bool ParseU64(const std::string& s, std::uint64_t* out) {
 //   "zones":    [{"points":[[x,y],...],"color":0xRRGGBB,"filled":true,"thickness":2}],
 //   "trail":    [{"points":[[x,y],...],"color":0xRRGGBB,"thickness":2}],
 //   "landings": [{"x":cx,"y":cy,"size":20,"color":0xRRGGBB}],
-//   "texts":    [{"text":"IN","x":100,"y":200,"color":0xRRGGBB}]   // 文字走 OSD 位图，阶段3b 实现
 // }
+// IVPS 实际 color 语义是 0xGGBBRR（bit23-16=G），与头文件注释的 0xRRGGBB 相反（实测红→绿）。
+// 把标准 0xRRGGBB 转成 IVPS 期望的布局，让传进来的颜色能正确显示。
+inline std::uint32_t ToIvpsColor(std::uint32_t c) {
+    return (((c >> 8) & 0xFF) << 16) | ((c & 0xFF) << 8) | ((c >> 16) & 0xFF);
+}
+
 bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
     if (!j.is_object()) return false;
     out->hold_frames = 0;  // 持续生效，直到被下一次 overlay 覆盖或 ClearOsd
@@ -78,7 +83,7 @@ bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
                 }
             }
             if (poly.points.size() < 3) continue;  // 多边形至少 3 点
-            if (z.contains("color")) poly.color = z["color"].get<std::uint32_t>();
+            if (z.contains("color")) poly.color = ToIvpsColor(z["color"].get<std::uint32_t>());
             if (z.contains("filled")) poly.filled = z["filled"].get<bool>();
             if (z.contains("thickness")) poly.thickness = z["thickness"].get<std::uint16_t>();
             out->polygons.push_back(std::move(poly));
@@ -95,7 +100,7 @@ bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
                 }
             }
             if (line.points.size() < 2) continue;  // 线至少 2 点
-            if (l.contains("color")) line.color = l["color"].get<std::uint32_t>();
+            if (l.contains("color")) line.color = ToIvpsColor(l["color"].get<std::uint32_t>());
             if (l.contains("thickness")) line.thickness = l["thickness"].get<std::uint16_t>();
             out->lines.push_back(std::move(line));
         }
@@ -113,12 +118,11 @@ bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
             r.width = static_cast<std::uint32_t>(size);
             r.height = static_cast<std::uint32_t>(size);
             r.thickness = 2;
-            if (d.contains("color")) r.color = d["color"].get<std::uint32_t>();
+            if (d.contains("color")) r.color = ToIvpsColor(d["color"].get<std::uint32_t>());
             out->rects.push_back(std::move(r));
         }
     }
 
-    // 文字 → bitmaps（点阵字库渲染，阶段3b 实现；此处忽略）
     return true;
 }
 
