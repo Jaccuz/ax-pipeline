@@ -183,6 +183,36 @@ bool PipelineService::GetPreviewJpeg(const std::string& name,
     return inst->GetPreviewJpeg(opt, out_jpeg, error);
 }
 
+std::vector<DetectionBatch> PipelineService::DrainDetections(const std::string& name,
+                                                             std::uint64_t since_seq,
+                                                             std::string* error) const {
+    std::shared_ptr<PipelineInstance> inst;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        inst = GetInstanceLocked(name);
+        if (!inst) {
+            if (error) *error = "pipeline not found: " + name;
+            return {};
+        }
+    }
+    return inst->DrainDetections(since_seq);
+}
+
+bool PipelineService::GetVideoInfo(const std::string& name, VideoInfo* out, std::string* error) const {
+    if (out == nullptr) return false;
+    std::shared_ptr<PipelineInstance> inst;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        inst = GetInstanceLocked(name);
+        if (!inst) {
+            if (error) *error = "pipeline not found: " + name;
+            return false;
+        }
+    }
+    *out = inst->GetVideoInfo();
+    return true;
+}
+
 bool PipelineService::GetPipelineConfig(const std::string& name, ConfigLoader::PipelineCfg* out, std::string* error) const {
     if (out == nullptr) return false;
     std::shared_ptr<PipelineInstance> inst;

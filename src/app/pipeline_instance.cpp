@@ -140,13 +140,40 @@ void PipelineInstance::BuildFrameCallback() {
     });
 }
 
-void PipelineInstance::StoreLastDetections(std::vector<ai::Detection> dets, std::uint64_t seq) noexcept {
+void PipelineInstance::StoreLastDetections(std::vector<ai::Detection> dets, std::uint64_t seq, std::uint64_t pts_ms) noexcept {
     last_det_seq_ = seq;
-    last_dets_ = std::move(dets);
+    last_dets_ = dets;  // 最新帧（源图坐标，preview 画框用）
+    det_queue_.push_back(DetectionBatch{seq, pts_ms, std::move(dets)});
+    while (det_queue_.size() > kDetQueueCapacity) {
+        det_queue_.pop_front();
+    }
 }
 
 std::vector<ai::Detection> PipelineInstance::GetLastDetectionsLocked() const {
     return last_dets_;
+}
+
+std::vector<DetectionBatch> PipelineInstance::DrainDetections(std::uint64_t since_seq) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<DetectionBatch> out;
+    out.reserve(det_queue_.size());
+    for (const auto& b : det_queue_) {
+        if (b.seq > since_seq) {
+            out.push_back(b);
+        }
+    }
+    return out;
+}
+
+VideoInfo PipelineInstance::GetVideoInfo() const {
+    VideoInfo v;
+    v.width = frame_info_->source_w.load(std::memory_order_relaxed);
+    v.height = frame_info_->source_h.load(std::memory_order_relaxed);
+    if (pipe_) {
+        const auto s = pipe_->GetInputStreamInfo();
+        v.fps = s.frame_rate;
+    }
+    return v;
 }
 
 void PipelineInstance::StartNpuIfEnabled() {
@@ -186,6 +213,12 @@ void PipelineInstance::StartNpuIfEnabled() {
         npu_ok_->store(0, std::memory_order_relaxed);
         npu_err_->store(0, std::memory_order_relaxed);
 
+        // 流帧率（事件队列 pts_ms 换算用）
+        int fps = 30;
+        if (const auto stream = pipe_->GetInputStreamInfo(); stream.frame_rate > 0.0) {
+            fps = static_cast<int>(std::lround(stream.frame_rate));
+        }
+
         auto* pipe_ptr = pipe_.get();
         auto fi = frame_info_;
         const auto resize_opts = cfg_.sdk.frame_output.resize;
@@ -199,12 +232,9 @@ void PipelineInstance::StartNpuIfEnabled() {
              resize_opts,
              enable_osd,
              ok = npu_ok_,
-             tracker](const std::vector<ai::Detection>& dets_infer, std::uint64_t seq) {
+             tracker,
+             fps](const std::vector<ai::Detection>& dets_infer, std::uint64_t seq) {
                 if (ok) ok->fetch_add(1, std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lock(mu_);
-                    StoreLastDetections(std::vector<ai::Detection>(dets_infer.begin(), dets_infer.end()), seq);
-                }
 
                 std::vector<ai::Detection> dets = dets_infer;
                 const auto sw = fi->source_w.load(std::memory_order_relaxed);
@@ -214,6 +244,13 @@ void PipelineInstance::StartNpuIfEnabled() {
                 if (sw != 0 && sh != 0 && iw != 0 && ih != 0) {
                     const auto map = ai::ComputeInferToSourceMap(sw, sh, iw, ih, resize_opts);
                     ai::MapDetectionsInferToSource(map, sw, sh, &dets);
+                }
+
+                // 事件队列 + 最新帧（源图坐标，与判罚 H 矩阵同源）
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    const auto pts_ms = (fps > 0) ? (seq * 1000ULL / static_cast<std::uint64_t>(fps)) : 0ULL;
+                    StoreLastDetections(dets, seq, pts_ms);
                 }
 
                 // 精度对比：dump 检测框（源图坐标）到文件，AXP_DUMP_DETS=1 启用；带 pipeline name 前缀区分多路

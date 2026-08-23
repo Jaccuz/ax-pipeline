@@ -47,6 +47,16 @@ bool ParseU32(const std::string& s, std::uint32_t* out) {
     }
 }
 
+bool ParseU64(const std::string& s, std::uint64_t* out) {
+    if (!out) return false;
+    try {
+        *out = std::stoull(s);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool ParseBool(const std::string& s, bool* out) {
     if (!out) return false;
     const auto v = Trim(s);
@@ -564,6 +574,60 @@ bool HttpApiServer::Start(const HttpServerOptions& opt, std::string* error) {
         res.status = 200;
         res.set_header("Cache-Control", "no-store");
         res.set_content(reinterpret_cast<const char*>(jpg.data()), jpg.size(), "image/jpeg");
+    });
+
+    // ax-stream：球坐标事件队列增量拉取（替代「只保留最新帧」，不漏落地帧）。
+    svr.Get("/api/v1/pipelines/:name/detections", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!AuthOk(req, impl_->opt.bearer_token)) {
+            res.status = 401;
+            res.set_content("unauthorized", "text/plain; charset=utf-8");
+            return;
+        }
+        const auto name_it = req.path_params.find("name");
+        if (name_it == req.path_params.end()) {
+            res.status = 400;
+            res.set_content("missing pipeline name", "text/plain; charset=utf-8");
+            return;
+        }
+
+        std::uint64_t since = 0;
+        if (req.has_param("since")) {
+            (void)ParseU64(req.get_param_value("since"), &since);
+        }
+
+        std::string err;
+        const auto batches = service_->DrainDetections(name_it->second, since, &err);
+        if (!err.empty()) {
+            ReplyError(res, 404, err);
+            return;
+        }
+
+        // 球坐标：源图坐标，输出中心点 + 宽高 + 置信度（对齐 Python 的 (cx,cy,w,h,conf)）。
+        json arr = json::array();
+        for (const auto& b : batches) {
+            json balls = json::array();
+            for (const auto& d : b.balls) {
+                balls.push_back(json{
+                    {"cx", (d.x0 + d.x1) / 2.0f},
+                    {"cy", (d.y0 + d.y1) / 2.0f},
+                    {"w", (d.x1 - d.x0)},
+                    {"h", (d.y1 - d.y0)},
+                    {"conf", d.score},
+                });
+            }
+            arr.push_back(json{
+                {"seq", b.seq},
+                {"pts_ms", b.pts_ms},
+                {"balls", std::move(balls)},
+            });
+        }
+
+        VideoInfo vi;
+        std::string verr;
+        (void)service_->GetVideoInfo(name_it->second, &vi, &verr);
+        const json video = json{{"w", vi.width}, {"h", vi.height}, {"fps", vi.fps}};
+
+        ReplyJson(res, 200, json{{"video", video}, {"batches", std::move(arr)}});
     });
 
     impl_->th = std::thread([this]() {

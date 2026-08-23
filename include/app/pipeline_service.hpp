@@ -40,6 +40,11 @@ public:
                         const PreviewOptions& opt,
                         std::vector<std::uint8_t>* out_jpeg,
                         std::string* error) const;
+    // ax-stream：取 seq 之后所有新帧（事件队列）+ 视频元信息。
+    std::vector<DetectionBatch> DrainDetections(const std::string& name,
+                                                std::uint64_t since_seq,
+                                                std::string* error) const;
+    bool GetVideoInfo(const std::string& name, VideoInfo* out, std::string* error) const;
     bool GetPipelineConfig(const std::string& name, ConfigLoader::PipelineCfg* out, std::string* error) const;
 
     void StopAll() noexcept;
