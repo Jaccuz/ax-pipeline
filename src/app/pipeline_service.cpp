@@ -213,6 +213,19 @@ bool PipelineService::GetVideoInfo(const std::string& name, VideoInfo* out, std:
     return true;
 }
 
+bool PipelineService::SetOverlay(const std::string& name, const axvsdk::common::DrawFrame& osd, std::string* error) {
+    std::shared_ptr<PipelineInstance> inst;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        inst = GetInstanceLocked(name);
+        if (!inst) {
+            if (error) *error = "pipeline not found: " + name;
+            return false;
+        }
+    }
+    return inst->SetOverlay(osd, error);
+}
+
 bool PipelineService::GetPipelineConfig(const std::string& name, ConfigLoader::PipelineCfg* out, std::string* error) const {
     if (out == nullptr) return false;
     std::shared_ptr<PipelineInstance> inst;

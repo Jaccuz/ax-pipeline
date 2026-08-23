@@ -84,6 +84,9 @@ public:
     // ax-stream：视频元信息（源图宽高/帧率）。
     VideoInfo GetVideoInfo() const;
 
+    // ax-stream：设置 OSD 叠加（区域/轨迹/落点/文字，源图坐标）。osd 由 HTTP overlay 端点翻译好传入。
+    bool SetOverlay(const axvsdk::common::DrawFrame& osd, std::string* error);
+
     // Add/remove encoding+mux outputs without restarting demux/vdec (if backend supports it).
     bool AddOutput(const axvsdk::pipeline::PipelineOutputConfig& output,
                    std::size_t* out_index,

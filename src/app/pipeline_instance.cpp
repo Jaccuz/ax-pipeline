@@ -176,6 +176,15 @@ VideoInfo PipelineInstance::GetVideoInfo() const {
     return v;
 }
 
+bool PipelineInstance::SetOverlay(const axvsdk::common::DrawFrame& osd, std::string* error) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pipe_) {
+        if (error) *error = "pipeline not opened";
+        return false;
+    }
+    return pipe_->SetOsd(osd);
+}
+
 void PipelineInstance::StartNpuIfEnabled() {
     if (!pipe_) return;
     if (!cfg_.npu.enable) return;

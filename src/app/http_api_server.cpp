@@ -57,6 +57,71 @@ bool ParseU64(const std::string& s, std::uint64_t* out) {
     }
 }
 
+// ax-stream overlay spec 翻译成 DrawFrame（源图坐标）。JSON 格式：
+// {
+//   "zones":    [{"points":[[x,y],...],"color":0xRRGGBB,"filled":true,"thickness":2}],
+//   "trail":    [{"points":[[x,y],...],"color":0xRRGGBB,"thickness":2}],
+//   "landings": [{"x":cx,"y":cy,"size":20,"color":0xRRGGBB}],
+//   "texts":    [{"text":"IN","x":100,"y":200,"color":0xRRGGBB}]   // 文字走 OSD 位图，阶段3b 实现
+// }
+bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
+    if (!j.is_object()) return false;
+    out->hold_frames = 0;  // 持续生效，直到被下一次 overlay 覆盖或 ClearOsd
+
+    // 区域 → polygons（凸多边形，可填充）
+    if (j.contains("zones") && j["zones"].is_array()) {
+        for (const auto& z : j["zones"]) {
+            axvsdk::common::DrawPolygon poly;
+            for (const auto& p : z.value("points", json::array())) {
+                if (p.is_array() && p.size() >= 2) {
+                    poly.points.push_back({p[0].get<int>(), p[1].get<int>()});
+                }
+            }
+            if (poly.points.size() < 3) continue;  // 多边形至少 3 点
+            if (z.contains("color")) poly.color = z["color"].get<std::uint32_t>();
+            if (z.contains("filled")) poly.filled = z["filled"].get<bool>();
+            if (z.contains("thickness")) poly.thickness = z["thickness"].get<std::uint16_t>();
+            out->polygons.push_back(std::move(poly));
+        }
+    }
+
+    // 轨迹 → lines（折线）
+    if (j.contains("trail") && j["trail"].is_array()) {
+        for (const auto& l : j["trail"]) {
+            axvsdk::common::DrawLine line;
+            for (const auto& p : l.value("points", json::array())) {
+                if (p.is_array() && p.size() >= 2) {
+                    line.points.push_back({p[0].get<int>(), p[1].get<int>()});
+                }
+            }
+            if (line.points.size() < 2) continue;  // 线至少 2 点
+            if (l.contains("color")) line.color = l["color"].get<std::uint32_t>();
+            if (l.contains("thickness")) line.thickness = l["thickness"].get<std::uint16_t>();
+            out->lines.push_back(std::move(line));
+        }
+    }
+
+    // 落点 → rects（以落点为中心的小方块）
+    if (j.contains("landings") && j["landings"].is_array()) {
+        for (const auto& d : j["landings"]) {
+            axvsdk::common::DrawRect r;
+            const int cx = d.value("x", 0);
+            const int cy = d.value("y", 0);
+            const int size = d.value("size", 20);
+            r.x = cx - size / 2;
+            r.y = cy - size / 2;
+            r.width = static_cast<std::uint32_t>(size);
+            r.height = static_cast<std::uint32_t>(size);
+            r.thickness = 2;
+            if (d.contains("color")) r.color = d["color"].get<std::uint32_t>();
+            out->rects.push_back(std::move(r));
+        }
+    }
+
+    // 文字 → bitmaps（点阵字库渲染，阶段3b 实现；此处忽略）
+    return true;
+}
+
 bool ParseBool(const std::string& s, bool* out) {
     if (!out) return false;
     const auto v = Trim(s);
@@ -628,6 +693,40 @@ bool HttpApiServer::Start(const HttpServerOptions& opt, std::string* error) {
         const json video = json{{"w", vi.width}, {"h", vi.height}, {"fps", vi.fps}};
 
         ReplyJson(res, 200, json{{"video", video}, {"batches", std::move(arr)}});
+    });
+
+    // ax-stream：OSD 叠加（区域 POLYGON / 轨迹 LINE / 落点 RECT / 文字位图，源图坐标）
+    svr.Post("/api/v1/pipelines/:name/overlay", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!AuthOk(req, impl_->opt.bearer_token)) {
+            ReplyError(res, 401, "unauthorized");
+            return;
+        }
+        const auto name_it = req.path_params.find("name");
+        if (name_it == req.path_params.end()) {
+            ReplyError(res, 400, "missing pipeline name");
+            return;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            ReplyError(res, 400, "invalid json");
+            return;
+        }
+
+        axvsdk::common::DrawFrame frame;
+        if (!ParseOverlaySpec(body, &frame)) {
+            ReplyError(res, 400, "invalid overlay spec");
+            return;
+        }
+
+        std::string err;
+        if (!service_->SetOverlay(name_it->second, frame, &err)) {
+            ReplyError(res, 400, err.empty() ? "set overlay failed" : err);
+            return;
+        }
+        ReplyJson(res, 200, json{{"ok", true}});
     });
 
     impl_->th = std::thread([this]() {

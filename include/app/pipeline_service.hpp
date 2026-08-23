@@ -45,6 +45,8 @@ public:
                                                 std::uint64_t since_seq,
                                                 std::string* error) const;
     bool GetVideoInfo(const std::string& name, VideoInfo* out, std::string* error) const;
+    // ax-stream：设置 OSD 叠加（区域/轨迹/落点/文字）。
+    bool SetOverlay(const std::string& name, const axvsdk::common::DrawFrame& osd, std::string* error);
     bool GetPipelineConfig(const std::string& name, ConfigLoader::PipelineCfg* out, std::string* error) const;
 
     void StopAll() noexcept;
