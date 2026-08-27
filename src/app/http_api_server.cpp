@@ -62,11 +62,34 @@ bool ParseU64(const std::string& s, std::uint64_t* out) {
 //   "zones":    [{"points":[[x,y],...],"color":0xRRGGBB,"filled":true,"thickness":2}],
 //   "trail":    [{"points":[[x,y],...],"color":0xRRGGBB,"thickness":2}],
 //   "landings": [{"x":cx,"y":cy,"size":20,"color":0xRRGGBB}],
+//   "bitmaps":  [{"x":dst_x,"y":dst_y,"width":w,"height":h,"data":"<base64 RGBA>","alpha":255}],
 // }
 // IVPS 实际 color 语义是 0xGGBBRR（bit23-16=G），与头文件注释的 0xRRGGBB 相反（实测红→绿）。
 // 把标准 0xRRGGBB 转成 IVPS 期望的布局，让传进来的颜色能正确显示。
 inline std::uint32_t ToIvpsColor(std::uint32_t c) {
     return (((c >> 8) & 0xFF) << 16) | ((c & 0xFF) << 8) | ((c >> 16) & 0xFF);
+}
+
+// base64 解码（用于 overlay bitmaps 的 data 字段，Python 侧预渲染文字/圆点 RGBA 位图）
+inline std::vector<std::uint8_t> Base64Decode(const std::string& in) {
+    static const std::string tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<std::uint8_t> out;
+    out.reserve(in.size() / 4 * 3);
+    std::uint32_t buf = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        const auto pos = tbl.find(c);
+        if (pos == std::string::npos) continue;
+        buf = (buf << 6) | static_cast<std::uint32_t>(pos);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<std::uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
 }
 
 bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
@@ -86,6 +109,7 @@ bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
             if (z.contains("color")) poly.color = ToIvpsColor(z["color"].get<std::uint32_t>());
             if (z.contains("filled")) poly.filled = z["filled"].get<bool>();
             if (z.contains("thickness")) poly.thickness = z["thickness"].get<std::uint16_t>();
+            if (z.contains("alpha")) poly.alpha = z["alpha"].get<std::uint8_t>();
             out->polygons.push_back(std::move(poly));
         }
     }
@@ -120,6 +144,32 @@ bool ParseOverlaySpec(const json& j, axvsdk::common::DrawFrame* out) {
             r.thickness = 2;
             if (d.contains("color")) r.color = ToIvpsColor(d["color"].get<std::uint32_t>());
             out->rects.push_back(std::move(r));
+        }
+    }
+
+    // 位图 → bitmaps（文字/轨迹圆点/落点十字/击球菱形，Python 侧预渲染 ARGB 位图，base64 data）
+    // 格式：{"x":dst_x,"y":dst_y,"width":w,"height":h,"data":"<base64 RGBA>","alpha":255,"format":<0-9>}
+    // format 对应 DrawBitmapFormat：0=Argb8888 1=Rgba8888 2=Argb1555 3=Rgba5551 4=Argb4444 5=Rgba4444 6=Argb8565 7=Rgb888 8=Rgb565 9=Bitmap1
+    if (j.contains("bitmaps") && j["bitmaps"].is_array()) {
+        for (const auto& b : j["bitmaps"]) {
+            axvsdk::common::DrawBitmap bm;
+            bm.format = axvsdk::common::DrawBitmapFormat::kArgb8888;
+            if (b.contains("format")) {
+                const int f = b["format"].get<int>();
+                if (f >= 0 && f <= 9) bm.format = static_cast<axvsdk::common::DrawBitmapFormat>(f);
+            }
+            bm.width = b.value("width", 0);
+            bm.height = b.value("height", 0);
+            bm.dst_x = b.value("x", 0);
+            bm.dst_y = b.value("y", 0);
+            if (b.contains("alpha")) bm.alpha = b["alpha"].get<std::uint16_t>();
+            // bitmap1（单色位图）用 color 字段指定前景色，语义 0xRRGGBB，与 zones 一样经 ToIvpsColor 转 IVPS 布局
+            if (b.contains("color")) bm.color = ToIvpsColor(b["color"].get<std::uint32_t>());
+            if (b.contains("data") && b["data"].is_string()) {
+                bm.data = Base64Decode(b["data"].get<std::string>());
+            }
+            if (bm.data.empty() || bm.width == 0 || bm.height == 0) continue;
+            out->bitmaps.push_back(std::move(bm));
         }
     }
 

@@ -182,7 +182,14 @@ bool PipelineInstance::SetOverlay(const axvsdk::common::DrawFrame& osd, std::str
         if (error) *error = "pipeline not opened";
         return false;
     }
-    return pipe_->SetOsd(osd);
+    if (!pipe_->SetOsd(osd)) {
+        if (error) *error = "SetOsd failed";
+        return false;
+    }
+    // 缓存（源图坐标），GetPreviewJpeg 叠加到 preview，让预览画面与判罚同源同步。
+    overlay_osd_ = osd;
+    has_overlay_ = true;
+    return true;
 }
 
 void PipelineInstance::StartNpuIfEnabled() {
@@ -702,6 +709,43 @@ bool PipelineInstance::GetPreviewJpeg(const PreviewOptions& opt,
                 if (drawer) {
                     (void)drawer->Draw(osd, *preview);
                 }
+            }
+        }
+    }
+
+    // 叠加 SetOverlay 的 OSD（球场/轨迹/落点/击球/文字位图），让预览画面与判罚同源同步。
+    // overlay_osd_ 是源图坐标，按 dst/src 比例缩放；位图 data 不缩放（预渲染固定尺寸），只缩放位置。
+    {
+        const axvsdk::common::DrawFrame osd = has_overlay_ ? overlay_osd_ : axvsdk::common::DrawFrame{};
+        if (!osd.lines.empty() || !osd.polygons.empty() || !osd.rects.empty() || !osd.bitmaps.empty()) {
+            const float sx = (src_w > 0) ? (static_cast<float>(dst_w) / static_cast<float>(src_w)) : 1.0F;
+            const float sy = (src_h > 0) ? (static_cast<float>(dst_h) / static_cast<float>(src_h)) : 1.0F;
+            axvsdk::common::DrawFrame scaled = osd;
+            for (auto& l : scaled.lines) {
+                for (auto& p : l.points) {
+                    p.x = static_cast<std::int32_t>(std::lround(p.x * sx));
+                    p.y = static_cast<std::int32_t>(std::lround(p.y * sy));
+                }
+            }
+            for (auto& pg : scaled.polygons) {
+                for (auto& p : pg.points) {
+                    p.x = static_cast<std::int32_t>(std::lround(p.x * sx));
+                    p.y = static_cast<std::int32_t>(std::lround(p.y * sy));
+                }
+            }
+            for (auto& r : scaled.rects) {
+                r.x = static_cast<std::int32_t>(std::lround(r.x * sx));
+                r.y = static_cast<std::int32_t>(std::lround(r.y * sy));
+                r.width = static_cast<std::uint32_t>(std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(r.width * sx))));
+                r.height = static_cast<std::uint32_t>(std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(r.height * sy))));
+            }
+            for (auto& bm : scaled.bitmaps) {
+                bm.dst_x = static_cast<std::uint32_t>(std::lround(bm.dst_x * sx));
+                bm.dst_y = static_cast<std::uint32_t>(std::lround(bm.dst_y * sy));
+            }
+            auto drawer = axvsdk::common::CreateDrawer();
+            if (drawer) {
+                (void)drawer->Draw(scaled, *preview);
             }
         }
     }
