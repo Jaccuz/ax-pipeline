@@ -115,6 +115,11 @@ private:
     // Caller must hold mu_.
     std::vector<ai::Detection> GetLastDetectionsLocked() const;
 
+    // 【2026-09-10 检测结果推送】Unix socket 生命周期 + 推送（替代 HTTP 轮询 drain）。
+    void StartDetectionsSocket(const std::string& name);
+    void StopDetectionsSocket() noexcept;
+    void PushDetections(const std::vector<ai::Detection>& dets, std::uint64_t seq, std::uint64_t pts_ms) noexcept;
+
     mutable std::mutex mu_;
     ConfigLoader::PipelineCfg cfg_;
     std::unique_ptr<axvsdk::pipeline::Pipeline> pipe_;
@@ -129,6 +134,19 @@ private:
     std::vector<ai::Detection> last_dets_;        // 最新帧（源图坐标，preview 画框用）
     std::deque<DetectionBatch> det_queue_;        // 事件队列（环形，容量见下）
     static constexpr std::size_t kDetQueueCapacity = 100;
+    // 检测结果（det_queue_ + last_dets_）专用锁：判罚进程高频 drain 只锁这把，
+    // 不跟 preview/overlay 的 mu_ 抢锁（否则 on_result 写检测结果被 HTTP 请求堵住 → 反压 VDEC 解码）。
+    mutable std::mutex det_mutex_;
+
+    // SetOverlay 缓存（源图坐标，GetPreviewJpeg 叠加到 preview，让预览画面与判罚同源同步）
+    axvsdk::common::DrawFrame overlay_osd_;
+    bool has_overlay_{false};
+
+    // 【2026-09-10 检测结果推送】Unix domain socket：on_result 直接把检测结果推给判罚进程
+    // （阻塞收），替代 HTTP 轮询 drain。每 pipeline 一个 socket 路径 /tmp/ax_det_{name}.sock。
+    int det_listen_fd_{-1};
+    int det_conn_fd_{-1};
+    std::string det_sock_path_;
 
     // 预览缓存:嵌入式 CMM 严禁按帧申请/释放(长期运行碎片化风险)。
     // buffer/processor/drawer 首次使用创建、尺寸变化才重建;mutex 串行化并发预览请求。

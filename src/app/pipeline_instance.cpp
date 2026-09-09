@@ -8,6 +8,14 @@
 #include <iostream>
 #include <utility>
 
+// 【2026-09-10 检测结果推送】Unix domain socket（判罚进程阻塞收，替代 HTTP 轮询）
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include "ai/ax_resize_map.hpp"
 #include "codec/ax_jpeg_codec.h"
 #include "common/ax_drawer.h"
@@ -26,6 +34,23 @@ bool EnvFlagEnabled(const char* name) {
 
 std::uint32_t AlignEven(std::uint32_t v) noexcept {
     return (v % 2U) ? (v - 1U) : v;
+}
+
+// 【2026-09-10 检测结果推送】阻塞写满 n 字节（Unix socket，检测结果推送用）
+bool WriteExact(int fd, const void* buf, std::size_t n) {
+    const auto* p = static_cast<const std::uint8_t*>(buf);
+    std::size_t left = n;
+    while (left > 0) {
+        const ssize_t w = ::write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;  // 非阻塞 buffer 满，丢帧
+            return false;
+        }
+        p += static_cast<std::size_t>(w);
+        left -= static_cast<std::size_t>(w);
+    }
+    return true;
 }
 
 }  // namespace
@@ -141,6 +166,7 @@ void PipelineInstance::BuildFrameCallback() {
 }
 
 void PipelineInstance::StoreLastDetections(std::vector<ai::Detection> dets, std::uint64_t seq, std::uint64_t pts_ms) noexcept {
+    std::lock_guard<std::mutex> lock(det_mutex_);
     last_det_seq_ = seq;
     last_dets_ = dets;  // 最新帧（源图坐标，preview 画框用）
     det_queue_.push_back(DetectionBatch{seq, pts_ms, std::move(dets)});
@@ -150,11 +176,12 @@ void PipelineInstance::StoreLastDetections(std::vector<ai::Detection> dets, std:
 }
 
 std::vector<ai::Detection> PipelineInstance::GetLastDetectionsLocked() const {
+    std::lock_guard<std::mutex> lock(det_mutex_);
     return last_dets_;
 }
 
 std::vector<DetectionBatch> PipelineInstance::DrainDetections(std::uint64_t since_seq) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(det_mutex_);
     std::vector<DetectionBatch> out;
     out.reserve(det_queue_.size());
     for (const auto& b : det_queue_) {
@@ -163,6 +190,71 @@ std::vector<DetectionBatch> PipelineInstance::DrainDetections(std::uint64_t sinc
         }
     }
     return out;
+}
+
+void PipelineInstance::StartDetectionsSocket(const std::string& name) {
+    StopDetectionsSocket();
+    det_sock_path_ = "/tmp/ax_det_" + name + ".sock";
+    ::unlink(det_sock_path_.c_str());
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, det_sock_path_.c_str(), sizeof(addr.sun_path) - 1);
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return;
+    }
+    if (::listen(fd, 1) != 0) {
+        ::close(fd);
+        return;
+    }
+    // 非阻塞 accept（on_result 里顺带 accept，不阻塞检测线程）
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    det_listen_fd_ = fd;
+}
+
+void PipelineInstance::StopDetectionsSocket() noexcept {
+    if (det_conn_fd_ >= 0) { ::close(det_conn_fd_); det_conn_fd_ = -1; }
+    if (det_listen_fd_ >= 0) { ::close(det_listen_fd_); det_listen_fd_ = -1; }
+    if (!det_sock_path_.empty()) { ::unlink(det_sock_path_.c_str()); det_sock_path_.clear(); }
+}
+
+void PipelineInstance::PushDetections(const std::vector<ai::Detection>& dets,
+                                      std::uint64_t seq, std::uint64_t pts_ms) noexcept {
+    // 非阻塞 accept（判罚进程 connect 时建立连接）
+    if (det_listen_fd_ >= 0 && det_conn_fd_ < 0) {
+        int c = ::accept(det_listen_fd_, nullptr, nullptr);
+        if (c >= 0) {
+            int flags = ::fcntl(c, F_GETFL, 0);
+            ::fcntl(c, F_SETFL, flags | O_NONBLOCK);  // 非阻塞写，buffer 满丢帧不阻塞检测
+            det_conn_fd_ = c;
+        }
+    }
+    if (det_conn_fd_ < 0) return;
+    // 序列化：header(magic+seq+pts_ms+ball_count) + balls(cx,cy,w,h,conf)（packed，与 Python struct 对齐）
+    struct __attribute__((packed)) DetectMsg {
+        std::uint32_t magic; std::uint64_t seq; std::uint64_t pts_ms; std::uint32_t ball_count;
+    } hdr;
+    hdr.magic = 0x444C5841U;  // 'AXLD' little-endian
+    hdr.seq = seq;
+    hdr.pts_ms = pts_ms;
+    hdr.ball_count = static_cast<std::uint32_t>(dets.size());
+    if (!WriteExact(det_conn_fd_, &hdr, sizeof(hdr))) return;
+    for (const auto& d : dets) {
+        // 与 HTTP 接口对齐：(cx,cy,w,h,conf) = 中心点 + 宽高 + 置信度
+        struct __attribute__((packed)) BallMsg {
+            float cx, cy, w, h, conf;
+        } b{
+            (d.x0 + d.x1) / 2.0f,
+            (d.y0 + d.y1) / 2.0f,
+            d.x1 - d.x0,
+            d.y1 - d.y0,
+            d.score,
+        };
+        if (!WriteExact(det_conn_fd_, &b, sizeof(b))) return;
+    }
 }
 
 VideoInfo PipelineInstance::GetVideoInfo() const {
@@ -263,10 +355,12 @@ void PipelineInstance::StartNpuIfEnabled() {
                 }
 
                 // 事件队列 + 最新帧（源图坐标，与判罚 H 矩阵同源）
+                // StoreLastDetections 内部锁 det_mutex_，不占 mu_（避免与 preview/overlay HTTP 请求抢锁）
                 {
-                    std::lock_guard<std::mutex> lock(mu_);
                     const auto pts_ms = (fps > 0) ? (seq * 1000ULL / static_cast<std::uint64_t>(fps)) : 0ULL;
                     StoreLastDetections(dets, seq, pts_ms);
+                    // 【2026-09-10 检测结果推送】Unix socket 推给判罚进程（替代 HTTP 轮询 drain）
+                    PushDetections(dets, seq, pts_ms);
                 }
 
                 // 精度对比：dump 检测框（源图坐标）到文件，AXP_DUMP_DETS=1 启用；带 pipeline name 前缀区分多路
@@ -401,6 +495,9 @@ bool PipelineInstance::Start(std::string* error) {
             if (!BuildPipeline(error)) return false;
             old_worker = DetachNpuWorkerLocked();
             StartNpuIfEnabled();
+            // 【2026-09-10 检测结果推送】建 Unix socket，供判罚进程 connect 收检测结果
+            // 注意：这里已持 mu_ 锁，直接读 cfg_.name（name() 会再锁 mu_ 死锁）
+            StartDetectionsSocket(cfg_.name);
         }
         if (running_) return true;
         if (!pipe_ || !pipe_->Start()) {
@@ -434,8 +531,11 @@ void PipelineInstance::Close() noexcept {
         running_ = false;
         worker = DetachNpuWorkerLocked();
         pipe = std::move(pipe_);
-        last_dets_.clear();
-        last_det_seq_ = 0;
+        {
+            std::lock_guard<std::mutex> det_lock(det_mutex_);
+            last_dets_.clear();
+            last_det_seq_ = 0;
+        }
         frame_counter_->store(0, std::memory_order_relaxed);
         frame_info_->source_w.store(0, std::memory_order_relaxed);
         frame_info_->source_h.store(0, std::memory_order_relaxed);
@@ -447,6 +547,8 @@ void PipelineInstance::Close() noexcept {
         pipe->Stop();
         pipe->Close();
     }
+    // 【2026-09-10 检测结果推送】关闭 Unix socket（判罚进程 recv 返回 0 断开）
+    StopDetectionsSocket();
 }
 
 bool PipelineInstance::Reconfigure(const ConfigLoader::PipelineCfg& cfg, bool autostart, std::string* error) {
@@ -466,8 +568,11 @@ bool PipelineInstance::Reconfigure(const ConfigLoader::PipelineCfg& cfg, bool au
 
         cfg_ = cfg;
         frame_counter_->store(0, std::memory_order_relaxed);
-        last_dets_.clear();
-        last_det_seq_ = 0;
+        {
+            std::lock_guard<std::mutex> det_lock(det_mutex_);
+            last_dets_.clear();
+            last_det_seq_ = 0;
+        }
     }
 
     if (old_worker) old_worker->Stop();
