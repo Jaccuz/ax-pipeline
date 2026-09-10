@@ -112,13 +112,15 @@ private:
 
     // Caller must hold mu_. 存最新帧（源图坐标）供 preview 画框，并 push 事件队列。
     void StoreLastDetections(std::vector<ai::Detection> dets, std::uint64_t seq, std::uint64_t pts_ms) noexcept;
-    // Caller must hold mu_.
-    std::vector<ai::Detection> GetLastDetectionsLocked() const;
+    // 最新一帧检测结果（源图坐标，preview 画框用）。自带 det_mutex_，
+    // 调用方不持 det_mutex_（持 mu_ 可以）。
+    std::vector<ai::Detection> GetLastDetections() const;
 
     // 【2026-09-10 检测结果推送】Unix socket 生命周期 + 推送（替代 HTTP 轮询 drain）。
     void StartDetectionsSocket(const std::string& name);
     void StopDetectionsSocket() noexcept;
-    void PushDetections(const std::vector<ai::Detection>& dets, std::uint64_t seq, std::uint64_t pts_ms) noexcept;
+    void PushDetections(const std::vector<ai::Detection>& dets, std::uint64_t seq, std::uint64_t pts_ms,
+                        const char* stream_name) noexcept;
 
     mutable std::mutex mu_;
     ConfigLoader::PipelineCfg cfg_;
@@ -147,6 +149,7 @@ private:
     int det_listen_fd_{-1};
     int det_conn_fd_{-1};
     std::string det_sock_path_;
+    std::uint64_t det_conn_since_ms_{0};  // 当前连接被接管时刻（见 kDetHandoverGuardMs）
 
     // 预览缓存:嵌入式 CMM 严禁按帧申请/释放(长期运行碎片化风险)。
     // buffer/processor/drawer 首次使用创建、尺寸变化才重建;mutex 串行化并发预览请求。

@@ -36,22 +36,50 @@ std::uint32_t AlignEven(std::uint32_t v) noexcept {
     return (v % 2U) ? (v - 1U) : v;
 }
 
-// 【2026-09-10 检测结果推送】阻塞写满 n 字节（Unix socket，检测结果推送用）
-bool WriteExact(int fd, const void* buf, std::size_t n) {
+// 【2026-09-10 检测结果推送】【2026-09-11 修复】按「整条消息」原子写（非阻塞 Unix socket）。
+// 原实现是 header 写一次、每个 ball 再各写一次：fd 是非阻塞的，中途 EAGAIN 会在对端
+// 留下「半条消息」，而客户端既不校验 magic、ball_count 也无上限 → 一旦错位就永久错位
+// （判罚结果全乱，且不会自愈）。现在改成先把整条消息拼进连续 buffer 再写：
+//   返回值  1 = 整条写完；
+//           0 = 一个字节都没写出去（buffer 满）→ 干净丢帧，连接保持；
+//          -1 = 写了半条，或连接已断（EPIPE/ECONNRESET/EBADF）→ 调用方必须断连，
+//               让客户端重连后从消息边界重新对齐。
+int WriteMessageAtomic(int fd, const void* buf, std::size_t n) noexcept {
     const auto* p = static_cast<const std::uint8_t*>(buf);
-    std::size_t left = n;
-    while (left > 0) {
-        const ssize_t w = ::write(fd, p, left);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;  // 非阻塞 buffer 满，丢帧
-            return false;
+    std::size_t off = 0;
+    while (off < n) {
+        const ssize_t w = ::write(fd, p + off, n - off);
+        if (w > 0) {
+            off += static_cast<std::size_t>(w);
+            continue;
         }
-        p += static_cast<std::size_t>(w);
-        left -= static_cast<std::size_t>(w);
+        if (w < 0 && errno == EINTR) continue;                       // 被信号打断，重试
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;  // buffer 满
+        return -1;                                                    // 连接不可用
     }
-    return true;
+    if (off == n) return 1;
+    return (off == 0) ? 0 : -1;  // 一个字节没写=干净丢帧；写了半条=链路已错位
 }
+
+// 【2026-09-11 修复】探测对端是否已关闭（MSG_PEEK 不消费数据）。
+// 用于 accept 时判断「旧连接是死是活」，避免新判罚进程被旧连接永久挡住。
+bool PeerClosed(int fd) noexcept {
+    char probe = 0;
+    const ssize_t r = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) return true;                                                    // 对端已关闭
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;        // 活着且暂无数据
+    return false;                                                               // 有数据 / 其它错误：按活着处理
+}
+
+std::uint64_t NowMs() noexcept {
+    using namespace std::chrono;
+    return static_cast<std::uint64_t>(
+        duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+// 【2026-09-11】连接接管保护窗：刚接管过再次收到新连接时，短暂忽略，
+// 避免两个都还活着的判罚进程每 0.5s 互踢一次（各拿一半帧比饿死更糟）。
+constexpr std::uint64_t kDetHandoverGuardMs = 2000;
 
 }  // namespace
 
@@ -175,8 +203,11 @@ void PipelineInstance::StoreLastDetections(std::vector<ai::Detection> dets, std:
     }
 }
 
-std::vector<ai::Detection> PipelineInstance::GetLastDetectionsLocked() const {
-    std::lock_guard<std::mutex> lock(det_mutex_);
+// 【2026-09-11 修复】原名为 GetLastDetectionsLocked（名字暗示「调用方需持锁」），
+// 但实现里自己加了 det_mutex_。当前唯一调用点只持 mu_ 所以没出事，
+// 但任何持 det_mutex_ 的调用方一旦调用它就会自死锁。改名 + 注释明确锁语义。
+std::vector<ai::Detection> PipelineInstance::GetLastDetections() const {
+    std::lock_guard<std::mutex> lock(det_mutex_);  // 本函数自己加锁，调用方不得持 det_mutex_
     return last_dets_;
 }
 
@@ -205,7 +236,9 @@ void PipelineInstance::StartDetectionsSocket(const std::string& name) {
         ::close(fd);
         return;
     }
-    if (::listen(fd, 1) != 0) {
+    // 【2026-09-11 修复】backlog 由 1 提到 8：backlog=1 时若有残留连接占位，
+    // 新判罚进程 connect 可能直接失败（ECONNREFUSED/阻塞），排查时无任何日志可看。
+    if (::listen(fd, 8) != 0) {
         ::close(fd);
         return;
     }
@@ -218,42 +251,80 @@ void PipelineInstance::StartDetectionsSocket(const std::string& name) {
 void PipelineInstance::StopDetectionsSocket() noexcept {
     if (det_conn_fd_ >= 0) { ::close(det_conn_fd_); det_conn_fd_ = -1; }
     if (det_listen_fd_ >= 0) { ::close(det_listen_fd_); det_listen_fd_ = -1; }
+    det_conn_since_ms_ = 0;
     if (!det_sock_path_.empty()) { ::unlink(det_sock_path_.c_str()); det_sock_path_.clear(); }
 }
 
 void PipelineInstance::PushDetections(const std::vector<ai::Detection>& dets,
-                                      std::uint64_t seq, std::uint64_t pts_ms) noexcept {
-    // 非阻塞 accept（判罚进程 connect 时建立连接）
-    if (det_listen_fd_ >= 0 && det_conn_fd_ < 0) {
-        int c = ::accept(det_listen_fd_, nullptr, nullptr);
-        if (c >= 0) {
-            int flags = ::fcntl(c, F_GETFL, 0);
+                                      std::uint64_t seq, std::uint64_t pts_ms,
+                                      const char* stream_name) noexcept {
+    // 1) accept：判罚进程 connect 时建立连接（listen fd 非阻塞，不阻塞检测线程）。
+    //    【2026-09-11 修复】原来只在 det_conn_fd_ < 0 时 accept 一次，于是：
+    //    「旧的、还活着的判罚进程」占住唯一连接后，新起的判罚进程会卡在 backlog 里
+    //    永远不被 accept → 静默饿死（死连接有 EPIPE 兜底，活连接完全没有）。
+    //    现在每帧清空 accept 队列只保留最新连接，并按下面规则决定是否接管。
+    if (det_listen_fd_ >= 0) {
+        int newest = -1;
+        for (;;) {
+            const int c = ::accept(det_listen_fd_, nullptr, nullptr);
+            if (c < 0) break;  // 无更多待处理连接
+            const int flags = ::fcntl(c, F_GETFL, 0);
             ::fcntl(c, F_SETFL, flags | O_NONBLOCK);  // 非阻塞写，buffer 满丢帧不阻塞检测
-            det_conn_fd_ = c;
+            if (newest >= 0) ::close(newest);
+            newest = c;
+        }
+        if (newest >= 0) {
+            const std::uint64_t now_ms = NowMs();
+            if (det_conn_fd_ >= 0 && !PeerClosed(det_conn_fd_)
+                && (now_ms - det_conn_since_ms_) < kDetHandoverGuardMs) {
+                // 刚接管过又有新连接：几乎可以断定是「刚被踢掉的一方在快速重连」。
+                // 若也照单接管，两个活进程会每 0.5s 互踢一次、各拿一半帧，比饿死更糟。
+                // 短暂忽略，让先接管的一方稳定下来。
+                ::close(newest);
+            } else {
+                if (det_conn_fd_ >= 0) {
+                    std::fprintf(stderr,
+                                 "[det_socket] %s 接管新判罚连接（旧连接%s），丢弃旧连接\n",
+                                 stream_name ? stream_name : "?",
+                                 PeerClosed(det_conn_fd_) ? "已断" : "仍活");
+                    ::close(det_conn_fd_);
+                }
+                det_conn_fd_ = newest;
+                det_conn_since_ms_ = now_ms;
+            }
         }
     }
     if (det_conn_fd_ < 0) return;
-    // 序列化：header(magic+seq+pts_ms+ball_count) + balls(cx,cy,w,h,conf)（packed，与 Python struct 对齐）
-    struct __attribute__((packed)) DetectMsg {
-        std::uint32_t magic; std::uint64_t seq; std::uint64_t pts_ms; std::uint32_t ball_count;
-    } hdr;
-    hdr.magic = 0x444C5841U;  // 'AXLD' little-endian
-    hdr.seq = seq;
-    hdr.pts_ms = pts_ms;
-    hdr.ball_count = static_cast<std::uint32_t>(dets.size());
-    if (!WriteExact(det_conn_fd_, &hdr, sizeof(hdr))) return;
+
+    // 2) 序列化「整条消息」到连续 buffer，再原子写出（header 与 balls 不能分开写，
+    //    否则中途 EAGAIN 会让对端永久错位，详见 WriteMessageAtomic 注释）。
+    //    packed 布局与 Python struct '<IQQI' + 每条 '<fffff' 一一对应。
+    static constexpr std::size_t kHdrSize = 24;   // magic(4)+seq(8)+pts_ms(8)+ball_count(4)
+    static constexpr std::size_t kBallSize = 20;  // cx,cy,w,h,conf（5×float）
+    thread_local std::vector<std::uint8_t> msg;   // thread_local：避免每帧堆分配
+    msg.resize(kHdrSize + dets.size() * kBallSize);
+    auto put_u32 = [&msg](std::size_t at, std::uint32_t v) { std::memcpy(&msg[at], &v, 4); };
+    auto put_u64 = [&msg](std::size_t at, std::uint64_t v) { std::memcpy(&msg[at], &v, 8); };
+    auto put_f32 = [&msg](std::size_t at, float v) { std::memcpy(&msg[at], &v, 4); };
+    put_u32(0, 0x444C5841U);  // 'AXLD' little-endian
+    put_u64(4, seq);
+    put_u64(12, pts_ms);
+    put_u32(20, static_cast<std::uint32_t>(dets.size()));
+    std::size_t off = kHdrSize;
     for (const auto& d : dets) {
         // 与 HTTP 接口对齐：(cx,cy,w,h,conf) = 中心点 + 宽高 + 置信度
-        struct __attribute__((packed)) BallMsg {
-            float cx, cy, w, h, conf;
-        } b{
-            (d.x0 + d.x1) / 2.0f,
-            (d.y0 + d.y1) / 2.0f,
-            d.x1 - d.x0,
-            d.y1 - d.y0,
-            d.score,
-        };
-        if (!WriteExact(det_conn_fd_, &b, sizeof(b))) return;
+        put_f32(off + 0, (d.x0 + d.x1) / 2.0f);
+        put_f32(off + 4, (d.y0 + d.y1) / 2.0f);
+        put_f32(off + 8, d.x1 - d.x0);
+        put_f32(off + 12, d.y1 - d.y0);
+        put_f32(off + 16, d.score);
+        off += kBallSize;
+    }
+    // rc == 0：一个字节都没写出去，只是 buffer 满，连接还在 → 只丢这一帧；
+    // rc < 0：写了半条或连接已断 → 必须断连，让客户端重连后重新对齐消息边界。
+    if (WriteMessageAtomic(det_conn_fd_, msg.data(), msg.size()) < 0) {
+        ::close(det_conn_fd_);
+        det_conn_fd_ = -1;
     }
 }
 
@@ -360,7 +431,7 @@ void PipelineInstance::StartNpuIfEnabled() {
                     const auto pts_ms = (fps > 0) ? (seq * 1000ULL / static_cast<std::uint64_t>(fps)) : 0ULL;
                     StoreLastDetections(dets, seq, pts_ms);
                     // 【2026-09-10 检测结果推送】Unix socket 推给判罚进程（替代 HTTP 轮询 drain）
-                    PushDetections(dets, seq, pts_ms);
+                    PushDetections(dets, seq, pts_ms, name.c_str());
                 }
 
                 // 精度对比：dump 检测框（源图坐标）到文件，AXP_DUMP_DETS=1 启用；带 pipeline name 前缀区分多路
@@ -498,6 +569,14 @@ bool PipelineInstance::Start(std::string* error) {
             // 【2026-09-10 检测结果推送】建 Unix socket，供判罚进程 connect 收检测结果
             // 注意：这里已持 mu_ 锁，直接读 cfg_.name（name() 会再锁 mu_ 死锁）
             StartDetectionsSocket(cfg_.name);
+        } else if (!npu_worker_) {
+            // 【2026-09-11 修复】Stop() 只把 NPU worker 摘掉、不销毁 pipeline
+            // （DetachNpuWorkerLocked 把 npu_worker_ 置空），而原来的 Start() 只在
+            // 「首次建 pipeline」分支里建 worker → 同一个 pipeline「先 stop 再 start」
+            // 之后 NPU 永远不会再推理，检测结果不再推送，判罚静默失效。
+            // 这里补上：pipeline 还在但 worker 没了，就重建 worker。
+            old_worker = DetachNpuWorkerLocked();   // 正常为 nullptr，防御性清理
+            StartNpuIfEnabled();
         }
         if (running_) return true;
         if (!pipe_ || !pipe_->Start()) {
@@ -630,7 +709,6 @@ bool PipelineInstance::UpdateNpu(const ConfigLoader::PipelineCfg::NpuCfg& npu,
                                 std::string* error) {
     std::shared_ptr<ai::AsyncInfer> old_worker;
     bool was_running = false;
-    bool need_restart = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
         was_running = running_;
@@ -638,6 +716,17 @@ bool PipelineInstance::UpdateNpu(const ConfigLoader::PipelineCfg::NpuCfg& npu,
         cfg_.npu_max_fps = npu_max_fps;
         old_worker = DetachNpuWorkerLocked();
         ClearOsdIfAny();
+    }
+    // 【2026-09-11 修复】必须先彻底停掉旧 worker（内部 join 线程）再起新的。
+    // 原实现是「先 StartNpuIfEnabled() 起新 worker，函数末尾才 Stop() 旧 worker」，
+    // 窗口期内新旧两个 worker 的 on_result 会同时往同一个判罚 socket 推帧，
+    // 判罚侧看到的 seq 会来回跳（重复/倒序），轨迹与落点被污染。
+    // stop 放在锁外：AsyncInfer::Stop 会 join 线程，持 mu_ 时 join 会与 on_result 路径互等。
+    if (old_worker) old_worker->Stop();
+
+    bool need_restart = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
         StartNpuIfEnabled();
         need_restart = autostart && was_running && pipe_ && !running_;
         if (need_restart) {
@@ -648,7 +737,6 @@ bool PipelineInstance::UpdateNpu(const ConfigLoader::PipelineCfg::NpuCfg& npu,
             running_ = true;
         }
     }
-    if (old_worker) old_worker->Stop();
     return true;
 }
 
@@ -780,7 +868,7 @@ bool PipelineInstance::GetPreviewJpeg(const PreviewOptions& opt,
     }
 
     if (opt.with_boxes) {
-        auto dets = GetLastDetectionsLocked();
+        auto dets = GetLastDetections();
         if (!dets.empty()) {
             const float sx = (src_w > 0) ? (static_cast<float>(dst_w) / static_cast<float>(src_w)) : 1.0F;
             const float sy = (src_h > 0) ? (static_cast<float>(dst_h) / static_cast<float>(src_h)) : 1.0F;
